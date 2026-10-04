@@ -1,63 +1,86 @@
 # clangd-mcp plan
 
-An MCP server that talks to a **live clangd process** and exposes C++ semantic
-queries as tools. The index is assumed to already exist (background-index
-shards or a merged `--index-file`). This server does not build, parse, or diff
-`.idx` files.
+An MCP server that is a **thin interface from agents to clangd**. Callers pass
+an already-built clangd index file (`clangd-indexer` output). The server
+starts clangd against that file and exposes clangd's semantic queries as MCP
+tools.
 
-The goal is not another thin LSP mirror. Existing clangd MCP servers already
-wrap `definition` / `references` / `workspace/symbol`. This one should be
-**review-context first**: given a change (files, hunks, or a symbol list),
-return the smallest structured neighborhood an agent needs to review it.
+This package does not implement review workflows, diff parsing, blast-radius
+reports, or index-file comparison. Those are consumers of the tools, not
+features of the server.
 
 ---
 
-## Why clangd, not grep
+## Goal
 
-Agent reviews of C++ fail in predictable ways when they only have text search:
+Give agents the same project-wide C++ intelligence an editor gets from clangd
+— symbols, xrefs, hover, call/type hierarchy — over MCP, backed by a
+**prebuilt static index**.
 
-- Overloads, templates, and macros do not match by name.
-- A one-line signature change can have a blast radius across TUs.
-- Virtual methods need implementations and derived types, not just call sites.
-- A header-only change needs the paired `.cpp` and every includer.
-- "Who tests this?" is usually an incoming-call / reference question.
+The server:
 
-clangd already answers these from the index. The MCP should package those
-answers for agents: compact, structured, capped, and keyed so an external
-index-diff pipeline can join later.
+1. Starts (or later: talks to) clangd with `--index-file=<path>`.
+2. Opens workspace files on demand (`didOpen`) for position-based requests.
+3. Forwards clangd LSP / clangd-extension requests as MCP tools.
+4. Returns compact, structured JSON (capped lists, workspace-relative paths).
+
+It does **not** build the index, parse `.idx`/RIFF shards, or interpret git
+diffs.
+
+---
+
+## Why this exists
+
+Agents default to grep. That misses overloads, templates, macros, virtual
+dispatch, and cross-TU references. clangd already answers those from an
+index. This MCP is the socket.
+
+Typical *callers* (not built in):
+
+- A review agent that already has a diff and wants callers / implementations
+  for symbols it resolved itself.
+- A pipeline that diffs two index files elsewhere, then looks up the
+  surviving names/locations here.
+- Interactive exploration: "what is this type?", "who calls this?"
 
 ---
 
 ## Constraints
 
-- **One clangd, one index.** The server is self-contained. It queries whatever
-  clangd was started with. Comparing two indexes (regression A vs B, main vs
-  PR) is done *outside* this MCP. The join keys we return (`usr`, clangd
-  `id`, qualified name, definition location) are what those external diffs
-  should emit.
-- **Index is already built.** Startup should load existing
-  `.cache/clangd/index` shards or a frozen `--index-file`. We do not wait
-  to reindex the world.
-- **No public "lookup by SymbolID" in LSP.** clangd can look up by
-  `SymbolID` internally (`SymbolIndex::lookup`), but LSP only offers fuzzy
-  `workspace/symbol` (by name) and position-based requests. External index
-  diffs must therefore hand us **qualified names and/or file:line:col**, not
-  only opaque IDs. We still *return* `usr` / `id` from
-  `textDocument/symbolInfo` so those pipelines can correlate.
-- **Agents have tiny context windows.** Tools must default to summaries
-  (counts, top files, 1-hop neighbors) with optional expansion.
+- **Index file is the input.** Startup takes a path to a static index
+  produced by `clangd-indexer` (RIFF or YAML). clangd is launched with
+  `--index-file=... --background-index=false` so it does not rebuild or
+  incrementally update the project.
+- **One clangd, one index.** Comparing two indexes is out of process. Run
+  two MCP instances if you need before/after.
+- **Sources must match the index.** Static indexes store absolute paths.
+  The workspace tree clangd sees has to line up with how the index was
+  built.
+- **No LSP lookup by SymbolID / USR.** clangd can do `SymbolIndex::lookup`
+  internally; LSP only has fuzzy `workspace/symbol` and position-based
+  requests. Callers join by **name and/or `file:line:col`**. Tools still
+  return `usr` and clangd `id` from `textDocument/symbolInfo` when a
+  position is available.
+- **AST-backed vs index-backed.** Project-wide search, references, and
+  call hierarchy come from the static index. Hover, document symbols,
+  diagnostics, and AST still need `didOpen` plus a compile command for
+  that file. A `compile_commands.json` (or equivalent) remains required
+  for those tools; index-only tools can still answer without opening
+  every TU.
 
 ---
 
-## Non-goals (v1)
+## Non-goals
 
-- Parsing or diffing clangd RIFF/YAML index shards.
-- Building or refreshing the project index.
-- Running two clangd processes and synthesizing an inter-index diff.
-- Code completion, rename, apply-edit, or format.
+- Review composites (`review_context`, hunk mapping, blast-radius ranking,
+  "which files should a human open", test-path heuristics).
+- Parsing unified diffs or git patches.
+- Parsing or diffing clangd index files.
+- Building or refreshing the index (`clangd-indexer` stays a separate step).
+- Completion, rename, apply-edit, format.
 - Whole-TU AST dumps.
-- Attaching to an already-running editor clangd (we spawn our own).
 - Remote-index / clangd-index-server protocol.
+- Attaching to an already-running editor clangd (v1 spawns its own process).
 
 ---
 
@@ -65,281 +88,139 @@ index-diff pipeline can join later.
 
 ```mermaid
 flowchart LR
-  Agent["Review agent"] -->|"MCP stdio"| MCP["clangd-mcp"]
+  Agent["Agent"] -->|"MCP stdio"| MCP["clangd-mcp"]
   MCP -->|"LSP JSON-RPC stdio"| Clangd["clangd"]
-  Clangd --> Index["Existing index<br/>.cache/clangd/index or --index-file"]
-  Disk["Workspace files"] --> MCP
+  Index["Prebuilt index file<br/>clangd-indexer output"] --> Clangd
+  WS["Workspace + compile_commands"] --> Clangd
   MCP -->|"didOpen / didClose"| Clangd
 ```
 
 Layers:
 
-1. **Process manager** — spawn clangd with workspace root, compile-commands
-   dir, and index flags. Restart on crash. Expose ready/health.
+1. **Process manager** — spawn clangd with the index file and workspace
+   root. Restart on crash. Surface ready/health. Whether the clangd
+   binary is bundled in this package or taken from `PATH` is an open
+   question (see below).
 2. **LSP client** — Content-Length JSON-RPC, request IDs, notifications
-   (`publishDiagnostics`, `clangd.fileStatus`, `inactiveRegions`).
-3. **Document session** — before any position-based call: read file from
-   disk, `didOpen`, wait until `fileStatus` is idle (or timeout). Close
-   idle files so ASTs do not accumulate.
-4. **Tool layer** — primitives (one or two LSP calls) and composites
-   (review-oriented aggregations). All paths relative to workspace root.
-   UTF-8 offsets negotiated with clangd.
+   (`publishDiagnostics`, `clangd.fileStatus`).
+3. **Document session** — for position-based calls: read the file,
+   `didOpen`, wait until `fileStatus` is idle (or timeout). Close idle
+   files so ASTs do not accumulate.
+4. **Tool layer** — one MCP tool ≈ one clangd request (or a short
+   prepare/resolve pair such as call hierarchy). No product logic on top.
 
-Config (env and/or CLI, resolved at process start):
+Config (CLI and/or env, resolved at process start):
 
 | Setting | Purpose |
 | --- | --- |
-| `CLANGD_MCP_WORKSPACE` | Project root (`rootUri`) |
-| `CLANGD_MCP_CLANGD` | clangd binary (default `clangd`) |
-| `CLANGD_MCP_COMPILE_COMMANDS_DIR` | `initializationOptions.compilationDatabasePath` |
-| `CLANGD_MCP_INDEX_FILE` | optional frozen `--index-file` |
-| `CLANGD_MCP_CLANGD_ARGS` | extra flags |
-| result caps | `max_results`, snippet lines, call-graph depth |
+| index file | **Required.** Passed as clangd `--index-file`. |
+| workspace root | **Required.** LSP `rootUri`; sources must match the index. |
+| clangd binary | Default `clangd` on `PATH`, unless we vendor one. |
+| compile-commands dir | Optional override for `compilationDatabasePath`. |
+| extra clangd args | Escape hatch. |
+| result caps | `max_results` and similar, applied in the MCP. |
 
-Recommended clangd flags: `--background-index` so existing shards load,
-`--limit-references` left to us (we cap in the MCP), `--offset-encoding=utf-8`.
+clangd argv (v1):
+
+```text
+clangd --index-file=<abs> --background-index=false --offset-encoding=utf-8
+       [--compile-commands-dir=<dir>]
+```
+
+`--background-index=false` is important: the static index from
+`clangd-indexer` is not the same format as `.cache/clangd/index` shards,
+and we do not want clangd to start a full project reindex on first
+`didOpen`.
 
 ### Language
 
 **TypeScript + official `@modelcontextprotocol/sdk`**, Node 20+, stdio
-transport. MCP is specified around that SDK; Cursor / Claude Code config is
-a one-line `npx`/`node` command. The LSP client is small and testable.
-
-Python is a fine alternative if we want fewer JS toolchain bits. The tool
-surface below does not depend on the language.
-
----
-
-## Use cases
-
-### 1. Agent code review (primary)
-
-Input: a PR diff or a list of touched files/hunks.
-Output: the symbols in those hunks, what they are, who calls them, who
-implements them, which other files are in the blast radius, and any
-diagnostics on the touched TUs.
-
-This is the reason the server exists. An agent should be able to call
-**one** composite tool and get enough structure to write a review, then
-drill in with primitives only when something looks wrong.
-
-### 2. Blast radius / API-break detection
-
-"If this virtual method or free function changes shape, what else must
-change?" Incoming calls, references grouped by file, implementations,
-derived types. Useful for reviewers and for agents proposing refactors.
-
-### 3. Finding the tests that cover a change
-
-Incoming calls and references whose paths look like tests (`*test*`,
-`*_test.cpp`, `unittests/`). Reviewers often miss that a helper is only
-tested indirectly.
-
-### 4. Header/source and include pairing
-
-A diff that only touches `Foo.h` still needs `Foo.cpp` and the main
-includers. `switchSourceHeader` plus reference summaries on the header's
-primary symbols.
-
-### 5. Inheritance and override review
-
-Changing a base class, a virtual, or a type used as a template argument.
-Type hierarchy (bases + derived) and `textDocument/implementation` catch
-what grep cannot.
-
-### 6. Template / overload / macro-aware navigation
-
-Position-based definition, hover, and AST-on-range. Agents stop guessing
-which overload a call binds to.
-
-### 7. Onboarding and "what is this symbol?"
-
-Hover + definition snippet + qualified name + USR + a short reference
-summary. Good for agents answering questions, not only reviewing diffs.
-
-### 8. Dead or suspiciously unused API
-
-Reference counts near 1 (declaration/definition only) on a symbol in the
-diff. A hint, not a proof (macros and out-of-index TUs exist).
-
-### 9. Diagnostics as review signal
-
-`publishDiagnostics` for every file in the change. New errors/warnings are
-often the cheapest "this PR is wrong" signal.
-
-### 10. Joining an *external* index-diff (regression / evolution)
-
-An outside job diffs two clangd indexes (or two `--index-file` dumps) and
-produces added / removed / changed symbols as `{name, usr?, id?, location?}`.
-This MCP then explains the **current** index side: definition, owners,
-callers, hierarchy. Evolution narratives ("this type gained three derived
-classes") are composed by the agent from (external delta) + (live queries).
-
-The MCP stays self-contained: it never opens the other index.
-
-### 11. Reviewing generated or ABI-sensitive code
-
-Hover and a bounded AST range show deduced types, implicit conversions, and
-record layout clues without dumping the TU.
-
-### 12. "Which extra files should a human open?"
-
-A derived file list: paired headers/sources, files with the most incoming
-calls, files that implement a changed interface. This is a ranking problem
-on top of the same primitives.
+transport. Easy Cursor / Claude Code config. The tool list does not
+depend on the language; Python is fine if preferred before Phase 1.
 
 ---
 
 ## Tools
 
-Two tiers. Composites are the product. Primitives exist so an agent can
-zoom in without us inventing a new mega-tool for every question.
+Each tool is a direct clangd capability. Light presentation only: relative
+paths, UTF-8 positions, default result caps, optional snippets. No
+cross-tool "review report" assembly.
 
-Every tool that resolves a concrete symbol should include, when clangd
-provides it:
+When a tool is position-based and clangd can resolve the token, include
+`name`, `containerName`, `kind`, `usr`, `id` from `textDocument/symbolInfo`
+where it is cheap (one extra request).
 
-- `name`, `containerName`, `kind`
-- `usr`, `id` (from `textDocument/symbolInfo`)
-- `declaration` / `definition` locations
-- workspace-relative paths, 0-based line/character (UTF-8)
+Default caps (overridable per call): `max_results=50`, `snippet_lines=0`,
+`call_depth=1`.
 
-Hard default caps (overridable per call): `max_symbols=40`,
-`max_refs=50`, `max_callers=30`, `snippet_lines=3`, `call_depth=1`.
-
-### Composite tools (build first)
-
-#### `review_context`
-
-The main tool.
-
-**Input**
-
-- `files`: `{ path, ranges?: [{start_line, end_line}] }[]`
-- **or** `unified_diff`: a standard unified diff (parsed internally)
-- `include_diagnostics?: bool` (default true)
-- `include_callers?: bool` (default true)
-- caps as above
-
-**Work**
-
-1. Normalize to file + line ranges.
-2. `didOpen` each file; `documentSymbol`.
-3. Keep symbols whose range overlaps a hunk. If a file has no ranges, keep
-   top-level symbols only (do not explode a 5k-line file).
-4. For each kept symbol, at `selectionRange` start:
-   - `symbolInfo`
-   - hover (truncated)
-   - `references` with `container` capability → **summary**: total count,
-     counts by file, top N locations with optional snippets
-   - incoming calls (depth 1) if it looks like a function
-   - implementations if it looks like a class / virtual
-   - type hierarchy (parents + children, depth 1) if it looks like a type
-   - paired header/source via `switchSourceHeader`
-5. Diagnostics for opened files.
-6. A `blast_radius` section: extra files ranked by ref/call count, plus
-   paired headers/sources not in the original diff.
-
-**Output** — compact JSON, not prose. The agent writes the review.
-
-#### `symbol_impact`
-
-Same neighborhood as above for **one** symbol, addressed by:
-
-- `path` + `line` + `character`, or
-- `query` (workspace symbol search; require a unique match or return
-  candidates)
-
-Use when the agent already knows the interesting symbol.
-
-#### `symbols_in_range`
-
-Map hunks → overlapping `documentSymbol` entries (name, kind, range,
-container). Cheap first step if `review_context` is too heavy or the agent
-wants to filter before impact analysis.
-
-#### `explain_symbol`
-
-Hover + definition snippet + `symbolInfo` + 1-line signature. The "what is
-this?" tool. No reference crawl unless `include_summary=true`.
-
-### Primitive tools
-
-| Tool | LSP | Notes |
+| Tool | clangd / LSP | Notes |
 | --- | --- | --- |
-| `search_symbols` | `workspace/symbol` | Fuzzy name search. Support `::` scope hints the way clangd does. |
-| `get_symbol_info` | `textDocument/symbolInfo` | USR + clangd id. Join key for external index diffs. |
-| `get_hover` | `textDocument/hover` | Type + comments. Truncate. |
+| `search_symbols` | `workspace/symbol` | Fuzzy name search; `::` scope hints as clangd implements them. |
+| `get_symbol_info` | `textDocument/symbolInfo` | USR + clangd `id` at a position. |
+| `get_hover` | `textDocument/hover` | Truncate long markdown. |
 | `get_definition` | `textDocument/definition` | |
 | `get_declaration` | `textDocument/declaration` | |
 | `get_type_definition` | `textDocument/typeDefinition` | Useful for `auto` / typedefs. |
-| `find_references` | `textDocument/references` | Enable `textDocument.references.container`. Return grouped summary by default; `expand=true` for full list. |
-| `find_implementations` | `textDocument/implementation` | Virtuals and interfaces. |
+| `find_references` | `textDocument/references` | Enable `textDocument.references.container`. Cap the list; optional grouping by file is presentation, not analysis. |
+| `find_implementations` | `textDocument/implementation` | |
 | `get_callers` | `prepareCallHierarchy` + `incomingCalls` | `depth` default 1. |
 | `get_callees` | `prepareCallHierarchy` + `outgoingCalls` | Same. |
 | `get_type_hierarchy` | `prepareTypeHierarchy` + super/sub | `direction`: parents, children, both. |
-| `get_file_symbols` | `textDocument/documentSymbol` | File outline. |
-| `get_diagnostics` | stored `publishDiagnostics` | Per file or all open. |
+| `get_file_symbols` | `textDocument/documentSymbol` | Outline of one file. |
+| `get_diagnostics` | stored `publishDiagnostics` | Per opened file. |
 | `switch_source_header` | `textDocument/switchSourceHeader` | |
-| `get_ast` | `textDocument/ast` | **Range required**, depth-capped. Never a whole file. |
-| `clangd_status` | fileStatus + initialize result | Ready?, open files, clangd version, index mode. |
+| `get_ast` | `textDocument/ast` | Range required, depth-capped. |
+| `clangd_status` | initialize + fileStatus | clangd version, index-file path, ready?, open files. |
 
-### Intentionally omitted (v1)
-
-- `completion` — not a review tool.
-- `rename` / `codeAction` / `formatting`.
-- `inlayHints` / `semanticTokens` / `inactiveRegions` as tools (we may
-  *consume* inactive regions later to mark `#if 0` hunks).
-- `$/memoryUsage` — debug-only; maybe behind `clangd_status(verbose)`.
+Omitted: `completion`, `rename`, `codeAction`, `formatting`, `inlayHints`,
+`semanticTokens`, `inactiveRegions` as tools, `$/memoryUsage` (maybe a
+verbose flag on `clangd_status` later).
 
 ---
 
-## Example agent flow
+## Example caller flow
 
-Review a PR that changes `src/sema/CheckCall.cpp` and `include/sema/Call.h`:
+A review agent (implemented elsewhere) has a diff and a list of
+`file:line:col` or symbol names:
 
-1. `review_context` with the unified diff.
-2. Read `blast_radius` and `symbols[].reference_summary`.
-3. If a virtual looks dangerous → `get_type_hierarchy` + `find_implementations`.
-4. If a free function looks widely used → `get_callers` with `depth=2` on
-   that symbol only.
-5. Write the review from the structured JSON, not from grepping the repo.
+1. `search_symbols` or `get_file_symbols` to bind a name/position.
+2. `get_definition` / `get_hover` / `get_symbol_info`.
+3. `find_references` / `get_callers` / `find_implementations` /
+   `get_type_hierarchy` as needed.
+4. The agent (or another tool) decides what is relevant to the review.
 
-External index-diff flow (outside this repo):
-
-1. Diff two indexes → `{added, removed, changed}` with name + location.
-2. For each changed symbol, `explain_symbol` or `symbol_impact` against
-   **this** clangd (the "after" tree).
-3. Agent narrates evolution. This MCP never saw the "before" index.
+An index-diff job (also elsewhere) emits added/removed/changed symbols
+with names and locations; it uses the same primitives against this MCP
+pointed at the "after" index file.
 
 ---
 
 ## Operational details
 
-**Readiness.** clangd is not useful until the workspace initialize handshake
-finishes and, for a given file, the preamble/AST is built. `review_context`
-must wait on `textDocument/clangd.fileStatus` (enable
-`initializationOptions.clangdFileStatus`) rather than firing LSP requests
-into a cold TU.
+**Readiness.** Wait for LSP initialize, then for the static index to
+finish loading (`--index-file` is applied asynchronously inside clangd).
+`clangd_status` should say when index-backed tools are safe. For an
+opened file, wait on `textDocument/clangd.fileStatus` before
+position-based AST requests.
 
-**didOpen cost.** Opening many TUs is the expensive part. Batch unique files
-from the diff, open them, query, then close. Do not keep the whole project
-open.
+**didOpen.** Only files the tool needs. Close after idle. Do not open the
+whole project.
 
-**Wrong compile command.** If `compile_commands.json` is missing or points
-at another build, every result is junk. Fail fast in `clangd_status` /
-startup if the CDB path does not exist.
+**Compile database.** Fail clearly if a position-based/AST tool is called
+and clangd has no compile command for that file. Index-only tools should
+still work.
 
-**Result hygiene.** Never return raw multi-thousand reference lists. Always
-counts + top-N. Snippets are opt-in. This matters more than adding more
-tools.
+**Result hygiene.** Cap lists. Do not dump thousands of reference
+locations unless the caller raises `max_results`.
 
-**Concurrency.** One clangd stdio socket: serialize LSP requests, allow
-concurrent MCP tool calls to queue. Composites should issue their LSP
-calls sequentially per file, files can be pipelined carefully later.
+**Concurrency.** One clangd stdio socket: serialize LSP requests; MCP
+tool calls queue.
 
-**Security / sandbox.** The server reads workspace files and starts a
-subprocess. It should not take arbitrary shell, and paths must stay under
-the workspace root (after realpath).
+**Paths.** Tool arguments that are files must resolve under the workspace
+root (after realpath). The index file may live outside the workspace
+(artifact store, regression output).
+
+**Security.** No arbitrary shell. Subprocess is clangd only.
 
 ---
 
@@ -347,66 +228,56 @@ the workspace root (after realpath).
 
 ### Phase 0 — this document
 
-Agree on use cases and the tool list before writing code.
+Agree that the server is a clangd interface, not a review product.
 
 ### Phase 1 — skeleton
 
-- Package, stdio MCP server, clangd spawn + initialize.
+- Package, stdio MCP server.
+- clangd spawn with required `--index-file` and `--background-index=false`.
 - Document session (`didOpen` / `didClose` / fileStatus wait).
-- `clangd_status`, `search_symbols`, `get_file_symbols`, `get_hover`,
-  `get_definition`, `find_references` (with container + grouping).
+- `clangd_status`, `search_symbols`, `get_hover`, `get_definition`,
+  `find_references`.
 
-### Phase 2 — review composites
+### Phase 2 — remaining clangd tools
 
-- `symbols_in_range`, `explain_symbol`, `symbol_impact`, `review_context`
-  (including unified-diff parse).
-- Call hierarchy, implementations, type hierarchy, diagnostics,
-  switch header.
-- `usr` / `id` on every resolved symbol.
+- Declaration, type definition, symbol info, document symbols.
+- Implementations, callers, callees, type hierarchy.
+- Diagnostics, switch header, bounded AST.
 
 ### Phase 3 — polish
 
-- Caps, snippets, blast-radius ranking, test-path heuristic.
-- `get_ast` (bounded).
-- Integration tests against a tiny C++ fixture + a recorded/mocked LSP
-  for unit tests.
-- README: Cursor / Claude Code MCP config.
-
-Tests do not require a huge project. A fixture with a base class, a
-virtual, two derived classes, a free function, and a test file is enough
-to lock the composites.
+- Caps, optional snippets, relative paths, `usr`/`id` on resolved
+  positions.
+- Unit tests against a mocked LSP; one integration test with a tiny C++
+  fixture + a `clangd-indexer` index file (if clangd is available).
+- README: how to point Cursor / Claude Code at the server.
 
 ---
 
 ## Open questions
 
-1. **TypeScript vs Python** — plan assumes TypeScript. Easy to flip before
-   Phase 1 if you prefer Python.
-2. **Should `review_context` accept a raw `git diff` on stdin-style
-   `unified_diff`, or only structured `files[]`?** Both is cheap; structured
-   is enough if the agent already parsed the patch.
-3. **Frozen `--index-file` as a first-class mode** for regression
-   machines, vs only background-index shards. I would support both in
-   config from day one (it is just a clangd argv flag).
-4. **Do we ever want a second clangd** (before/after) inside this process?
-   I would not. It breaks "self-contained" and doubles memory. Run two MCP
-   instances if you need two indexes.
-5. **Lookup-by-USR:** if you control the clangd you talk to, a tiny custom
-   LSP extension (`clangd/lookup` by `id` / `usr`) would make external
-   index-diff joins exact. That is a clangd change, not this repo. Worth
-   it only if name+location collision becomes real.
+1. **TypeScript vs Python** — plan assumes TypeScript.
+2. **Bundle clangd or not?** Ship a clangd (and maybe `clangd-indexer`)
+   next to the MCP vs require a compatible binary on `PATH`. Bundling
+   makes "index file in, answers out" more hermetic; it also means
+   versioning clangd with this repo and dealing with platform binaries.
+   v1 can require `PATH` and leave vendoring as a follow-up.
+3. **Index-only mode vs always needing a workspace checkout.** The static
+   index has symbol locations, but many LSP methods still open the file.
+   Assume a matching source tree for v1.
+4. **Lookup-by-USR** would need a clangd-side extension. Out of scope
+   unless name+location collisions become real.
 
 ---
 
 ## What success looks like
 
-An agent, given only a C++ diff and this MCP, can answer:
+An agent can point this server at a workspace and a `clangd-indexer`
+file and then, through MCP tools only:
 
-- Which symbols did this change actually touch?
-- Who calls them, who implements them, and which types sit above/below?
-- Which extra files (paired TU, tests, derived classes) a reviewer should
-  open?
-- Are there compile diagnostics on the touched files?
+- search project symbols
+- resolve definition / declaration / type / hover at a position
+- list references, callers, callees, implementations, bases/derived
+- outline a file and read its diagnostics
 
-…without reading the clangd index format and without dumping half the
-repository into the prompt.
+…without this repo knowing what a review, a diff, or a second index is.

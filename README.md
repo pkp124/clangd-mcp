@@ -1,14 +1,12 @@
 # clangd-mcp
 
-MCP server that talks to a live [clangd](https://clangd.llvm.org/) process and
-exposes C++ semantic queries as tools. The intended consumer is a review
-agent: given a change, get the relevant neighborhood (symbols, callers,
-implementations, type hierarchy, diagnostics) from an already-built clangd
-index.
+MCP server that is a thin interface from agents to
+[clangd](https://clangd.llvm.org/). You pass an already-built index file
+(`clangd-indexer` output); the server starts clangd against it and exposes
+clangd queries as tools.
 
-This server does not build, parse, or diff clangd index files. Index diffs
-from regression runs stay outside; this process queries one clangd / one
-index.
+This package does not build, parse, or diff indexes, and it does not
+implement review or diff workflows. Those belong in the caller.
 
-See [PLAN.md](./PLAN.md) for use cases, tool list, and implementation phases.
+See [PLAN.md](./PLAN.md) for the tool list and implementation phases.
 Implementation has not started yet.
