@@ -1,12 +1,15 @@
 # clangd-mcp
 
-MCP server that is a thin interface from agents to
-[clangd](https://clangd.llvm.org/). You pass an already-built index file
-(`clangd-indexer` output); the server starts clangd against it and exposes
-clangd queries as tools.
+Containerized MCP server: a thin interface from agents to
+[clangd](https://clangd.llvm.org/). The image ships clangd and
+`clangd-indexer`. Use it to **build** a static index and to **serve**
+clangd queries over MCP.
 
-This package does not build, parse, or diff indexes, and it does not
-implement review or diff workflows. Those belong in the caller.
+v1 keeps host paths as-is: bind-mount the workspace at the same absolute
+path inside the container.
 
-See [PLAN.md](./PLAN.md) for the tool list and implementation phases.
+This package does not implement review or diff workflows. Those belong in
+the caller.
+
+See [PLAN.md](./PLAN.md) for the tool list, image layout, and phases.
 Implementation has not started yet.
