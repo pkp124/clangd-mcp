@@ -1,0 +1,6 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.clangd-mcp/
+.DS_Store
+*.idx
