@@ -1,0 +1,28 @@
+{
+  "name": "clangd-mcp",
+  "version": "0.1.0",
+  "description": "Containerized MCP server that exposes clangd queries to agents",
+  "type": "module",
+  "bin": {
+    "clangd-mcp": "dist/src/main.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/src/main.js",
+    "typecheck": "tsc --noEmit",
+    "test": "tsc && node --test dist/test/*.test.js",
+    "test:image": "tsc && node dist/scripts/mcp-e2e.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.25.1",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^24.6.0",
+    "typescript": "^5.9.3"
+  }
+}
