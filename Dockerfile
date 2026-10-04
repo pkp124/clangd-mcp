@@ -15,8 +15,8 @@ RUN curl -fsSL -o /tmp/clangd.zip \
       "https://github.com/clangd/clangd/releases/download/${CLANGD_VERSION}/clangd-linux-${CLANGD_VERSION}.zip" \
     && curl -fsSL -o /tmp/clangd-index.zip \
       "https://github.com/clangd/clangd/releases/download/${CLANGD_VERSION}/clangd_indexing_tools-linux-${CLANGD_VERSION}.zip" \
-    && unzip -q /tmp/clangd.zip -d /opt \
-    && unzip -q /tmp/clangd-index.zip -d /opt \
+    && unzip -qo /tmp/clangd.zip -d /opt/clangd \
+    && unzip -qo /tmp/clangd-index.zip -d /opt/clangd-index \
     && install -m 0755 "$(find /opt -type f -name clangd -path '*/bin/*' | head -n 1)" /usr/local/bin/clangd \
     && install -m 0755 "$(find /opt -type f -name clangd-indexer -path '*/bin/*' | head -n 1)" /usr/local/bin/clangd-indexer \
     && install -m 0755 "$(find /opt -type f -name clangd-index-server -path '*/bin/*' | head -n 1)" /usr/local/bin/clangd-index-server \
