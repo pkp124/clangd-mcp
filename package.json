@@ -10,7 +10,8 @@
     "build": "tsc",
     "start": "node dist/src/main.js",
     "typecheck": "tsc --noEmit",
-    "test": "tsc && node --test dist/test/*.test.js"
+    "test": "tsc && node --test dist/test/*.test.js",
+    "test:image": "tsc && node dist/scripts/mcp-e2e.js"
   },
   "engines": {
     "node": ">=20"

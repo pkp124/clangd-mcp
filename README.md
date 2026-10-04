@@ -96,4 +96,12 @@ Without Docker, `npm run build && node dist/src/main.js serve ...` if
 Paths in tool arguments are absolute workspace paths (the same paths
 stored in the index). Positions are 0-based UTF-8.
 
+## CI
+
+GitHub Actions (`.github/workflows/ci.yml`) runs unit tests, builds the
+image, indexes `test/fixture` inside that image, then drives every MCP
+tool over `docker run -i … serve`. A second pass hosts the index with
+`clangd-index-server` and repeats the tool checks through
+`--remote-index`.
+
 See [PLAN.md](./PLAN.md) for the design.

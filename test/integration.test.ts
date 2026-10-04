@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { ClangdSession } from "../src/clangd/session.js";
+import { writeFixtureCompileCommands } from "./helpers/compile-commands.js";
 
 const clangd = process.env.CLANGD;
 const indexer = process.env.CLANGD_INDEXER;
@@ -20,21 +21,9 @@ test("index + search + references against the fixture", { skip: maybeSkip() }, a
   }
   const cxx = spawnSync("clang++", ["--version"], { encoding: "utf8" });
   assert.equal(cxx.status, 0);
-  const compileCommands = [
-    {
-      directory: fixture,
-      command: `clang++ -std=c++17 -I${fixture}/include -c ${fixture}/src/widget.cpp -o ${fixture}/src/widget.o`,
-      file: `${fixture}/src/widget.cpp`,
-    },
-    {
-      directory: fixture,
-      command: `clang++ -std=c++17 -I${fixture}/include -c ${fixture}/src/main.cpp -o ${fixture}/src/main.o`,
-      file: `${fixture}/src/main.cpp`,
-    },
-  ];
-  writeFileSync(join(fixture, "compile_commands.json"), JSON.stringify(compileCommands, null, 2));
+  const compileCommands = writeFixtureCompileCommands(fixture);
   const indexFile = join(tmpdir(), `clangd-mcp-fixture-${process.pid}.idx`);
-  const indexed = spawnSync(indexer, ["--executor=all-TUs", join(fixture, "compile_commands.json")]);
+  const indexed = spawnSync(indexer, ["--executor=all-TUs", compileCommands]);
   assert.equal(indexed.status, 0, indexed.stderr.toString());
   writeFileSync(indexFile, indexed.stdout);
 

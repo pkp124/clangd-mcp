@@ -6,3 +6,4 @@ dist/
 *.idx
 test/fixture/compile_commands.json
 test/fixture/**/*.o
+test/fixture/.clangd-mcp/
