@@ -1,31 +1,29 @@
 # clangd-mcp plan
 
-An MCP server that is a **thin interface from agents to clangd**. Callers pass
-an already-built clangd index file (`clangd-indexer` output). The server
-starts clangd against that file and exposes clangd's semantic queries as MCP
-tools.
+An MCP server that is a **thin interface from agents to clangd**, delivered
+as a **container**. The image includes clangd and `clangd-indexer`. The same
+image both **builds** a static index and **serves** MCP queries against it.
 
-This package does not implement review workflows, diff parsing, blast-radius
-reports, or index-file comparison. Those are consumers of the tools, not
-features of the server.
+The MCP tools themselves stay a clangd query interface. Review workflows,
+diff parsing, and index-file comparison stay in the caller.
 
 ---
 
 ## Goal
 
-Give agents the same project-wide C++ intelligence an editor gets from clangd
-— symbols, xrefs, hover, call/type hierarchy — over MCP, backed by a
-**prebuilt static index**.
+Give agents project-wide C++ intelligence (symbols, xrefs, hover, call/type
+hierarchy) over MCP, with a hermetic clangd stack.
 
-The server:
+The container:
 
-1. Starts (or later: talks to) clangd with `--index-file=<path>`.
-2. Opens workspace files on demand (`didOpen`) for position-based requests.
-3. Forwards clangd LSP / clangd-extension requests as MCP tools.
-4. Returns compact, structured JSON (capped lists, workspace-relative paths).
+1. **`index`** — run `clangd-indexer` on a `compile_commands.json` and write
+   a static index file.
+2. **`serve`** — start the MCP server, which starts clangd with
+   `--index-file=<that file> --background-index=false` and exposes clangd
+   requests as tools.
 
-It does **not** build the index, parse `.idx`/RIFF shards, or interpret git
-diffs.
+It does **not** interpret git diffs, assemble review reports, or parse
+index files by hand.
 
 ---
 
@@ -33,122 +31,187 @@ diffs.
 
 Agents default to grep. That misses overloads, templates, macros, virtual
 dispatch, and cross-TU references. clangd already answers those from an
-index. This MCP is the socket.
+index. This image is the clangd + indexer + MCP socket.
 
-Typical *callers* (not built in):
+Typical *callers* (not built into the tools):
 
 - A review agent that already has a diff and wants callers / implementations
   for symbols it resolved itself.
-- A pipeline that diffs two index files elsewhere, then looks up the
-  surviving names/locations here.
+- A pipeline that diffs two index files elsewhere, then looks up names or
+  locations here.
 - Interactive exploration: "what is this type?", "who calls this?"
 
 ---
 
 ## Constraints
 
-- **Index file is the input.** Startup takes a path to a static index
-  produced by `clangd-indexer` (RIFF or YAML). clangd is launched with
-  `--index-file=... --background-index=false` so it does not rebuild or
-  incrementally update the project.
-- **One clangd, one index.** Comparing two indexes is out of process. Run
-  two MCP instances if you need before/after.
-- **Sources must match the index.** Static indexes store absolute paths.
-  The workspace tree clangd sees has to line up with how the index was
-  built.
-- **No LSP lookup by SymbolID / USR.** clangd can do `SymbolIndex::lookup`
-  internally; LSP only has fuzzy `workspace/symbol` and position-based
-  requests. Callers join by **name and/or `file:line:col`**. Tools still
-  return `usr` and clangd `id` from `textDocument/symbolInfo` when a
-  position is available.
+- **Container is the unit of delivery.** clangd and `clangd-indexer` live
+  in the image (same clangd release). Callers do not install clangd on the
+  host.
+- **Index build is a container command, not an MCP tool.** Building an
+  index is a long batch job. `docker run … index` produces the file;
+  `docker run … serve` queries it. The MCP tool list stays query-only.
+- **One clangd, one index per serve process.** Comparing two indexes is
+  two containers (or two serve invocations).
+- **Paths stay as they are (v1).** clangd indexes store absolute paths.
+  We do **not** rewrite `compile_commands.json`, source paths, or index
+  URIs. Bind-mount the workspace (and anything the compile commands
+  reference) at the **same absolute path** inside the container as on the
+  host. Path remapping can come later if this becomes painful.
+- **No LSP lookup by SymbolID / USR.** Callers join by name and/or
+  `file:line:col`. Tools still return `usr` and clangd `id` from
+  `textDocument/symbolInfo` when a position is available.
 - **AST-backed vs index-backed.** Project-wide search, references, and
   call hierarchy come from the static index. Hover, document symbols,
   diagnostics, and AST still need `didOpen` plus a compile command for
-  that file. A `compile_commands.json` (or equivalent) remains required
-  for those tools; index-only tools can still answer without opening
-  every TU.
+  that file.
 
 ---
 
 ## Non-goals
 
-- Review composites (`review_context`, hunk mapping, blast-radius ranking,
-  "which files should a human open", test-path heuristics).
+- Review composites (hunk mapping, blast-radius ranking, test-path
+  heuristics).
 - Parsing unified diffs or git patches.
 - Parsing or diffing clangd index files.
-- Building or refreshing the index (`clangd-indexer` stays a separate step).
+- Rewriting or relocating paths inside the index / compile database (v1).
 - Completion, rename, apply-edit, format.
 - Whole-TU AST dumps.
 - Remote-index / clangd-index-server protocol.
-- Attaching to an already-running editor clangd (v1 spawns its own process).
+- Attaching to a host or editor clangd.
 
 ---
 
 ## Architecture
 
 ```mermaid
-flowchart LR
-  Agent["Agent"] -->|"MCP stdio"| MCP["clangd-mcp"]
-  MCP -->|"LSP JSON-RPC stdio"| Clangd["clangd"]
-  Index["Prebuilt index file<br/>clangd-indexer output"] --> Clangd
-  WS["Workspace + compile_commands"] --> Clangd
-  MCP -->|"didOpen / didClose"| Clangd
+flowchart TB
+  subgraph image["clangd-mcp image"]
+    Indexer["clangd-indexer"]
+    MCP["MCP server"]
+    Clangd["clangd"]
+    MCP -->|"LSP stdio"| Clangd
+  end
+  HostWS["Host workspace at /same/abs/path"] -->|"bind mount"| image
+  CDB["compile_commands.json"] --> Indexer
+  Indexer --> Idx["index file"]
+  Idx --> Clangd
+  Agent["Agent"] -->|"MCP stdio via docker run -i"| MCP
 ```
 
-Layers:
+Two entrypoints, one image:
 
-1. **Process manager** — spawn clangd with the index file and workspace
-   root. Restart on crash. Surface ready/health. Whether the clangd
-   binary is bundled in this package or taken from `PATH` is an open
-   question (see below).
-2. **LSP client** — Content-Length JSON-RPC, request IDs, notifications
-   (`publishDiagnostics`, `clangd.fileStatus`).
-3. **Document session** — for position-based calls: read the file,
-   `didOpen`, wait until `fileStatus` is idle (or timeout). Close idle
-   files so ASTs do not accumulate.
-4. **Tool layer** — one MCP tool ≈ one clangd request (or a short
-   prepare/resolve pair such as call hierarchy). No product logic on top.
+| Command | What it runs |
+| --- | --- |
+| `index` | `clangd-indexer` → static index file |
+| `serve` | MCP stdio server → child `clangd --index-file=…` |
 
-Config (CLI and/or env, resolved at process start):
+### Image contents
+
+Pin a **clangd GitHub release** (e.g. 22.x) and install matching assets:
+
+- `clangd-linux-*.zip` → `clangd`
+- `clangd_indexing_tools-linux-*.zip` → `clangd-indexer`
+
+(`clangd-indexer` is not in the LLVM distro packages; it is in the
+[clangd/clangd](https://github.com/clangd/clangd/releases) indexing-tools
+asset.)
+
+Also ship a default C/C++ compiler (image `clang`/`gcc`) so projects whose
+compile commands use `/usr/bin/c++` (or similar) can index without a host
+toolchain. If the project's compile commands point at a **custom**
+compiler path, bind-mount that path too. Same rule as sources: no rewrite.
+
+The MCP process is the image `CMD` (`serve`). `index` is an explicit
+subcommand.
+
+### Path rule (v1)
+
+```text
+host /home/me/proj     →  container /home/me/proj
+host /opt/my-toolchain →  container /opt/my-toolchain   # only if CDB needs it
+```
+
+```bash
+# Build the index (same image).
+docker run --rm \
+  -v /home/me/proj:/home/me/proj \
+  clangd-mcp index \
+    --compile-commands /home/me/proj/build/compile_commands.json \
+    --output /home/me/proj/.clangd-mcp/index.idx
+
+# Serve MCP over stdio (Cursor / Claude Code).
+docker run -i --rm \
+  -v /home/me/proj:/home/me/proj \
+  clangd-mcp serve \
+    --workspace /home/me/proj \
+    --index-file /home/me/proj/.clangd-mcp/index.idx
+```
+
+If `compile_commands.json` names `/home/me/proj/...` and the compiler
+`/usr/bin/c++`, both must exist at those paths in the container. The first
+comes from the bind mount; the second from the image (or another mount).
+
+### `index` command
+
+Thin wrapper around `clangd-indexer`, same version as the image clangd:
+
+```text
+clangd-indexer --executor=all-TUs <compile_commands.json> > <output>
+```
+
+Flags we expose: compile-commands path, output path, extra indexer args.
+The output is a static RIFF/YAML index suitable for `--index-file`.
+
+This is **not** an MCP tool. CI or a human runs `index` when the tree or
+compile database changes; agents then `serve`.
+
+### `serve` command
+
+1. Process manager starts clangd:
+   ```text
+   clangd --index-file=<abs> --background-index=false --offset-encoding=utf-8
+          [--compile-commands-dir=<dir>]
+   ```
+2. LSP client: Content-Length JSON-RPC, `publishDiagnostics`,
+   `clangd.fileStatus`.
+3. Document session: `didOpen` / wait idle / `didClose` for position-based
+   calls.
+4. Tool layer: one MCP tool ≈ one clangd request (or prepare/resolve).
+
+`--background-index=false` matters: the static `clangd-indexer` file is
+not the same format as `.cache/clangd/index` shards. We do not want a
+full reindex on first `didOpen`.
+
+Config for `serve`:
 
 | Setting | Purpose |
 | --- | --- |
-| index file | **Required.** Passed as clangd `--index-file`. |
-| workspace root | **Required.** LSP `rootUri`; sources must match the index. |
-| clangd binary | Default `clangd` on `PATH`, unless we vendor one. |
-| compile-commands dir | Optional override for `compilationDatabasePath`. |
+| index file | **Required.** clangd `--index-file`. |
+| workspace root | **Required.** LSP `rootUri`. |
+| compile-commands dir | Optional `compilationDatabasePath`. |
 | extra clangd args | Escape hatch. |
-| result caps | `max_results` and similar, applied in the MCP. |
+| result caps | Applied in the MCP. |
 
-clangd argv (v1):
+clangd binary path is internal to the image, not a user setting.
 
-```text
-clangd --index-file=<abs> --background-index=false --offset-encoding=utf-8
-       [--compile-commands-dir=<dir>]
-```
+### Language / MCP transport
 
-`--background-index=false` is important: the static index from
-`clangd-indexer` is not the same format as `.cache/clangd/index` shards,
-and we do not want clangd to start a full project reindex on first
-`didOpen`.
-
-### Language
-
-**TypeScript + official `@modelcontextprotocol/sdk`**, Node 20+, stdio
-transport. Easy Cursor / Claude Code config. The tool list does not
-depend on the language; Python is fine if preferred before Phase 1.
+**TypeScript + official `@modelcontextprotocol/sdk`**, Node 20+, **stdio**
+inside the container. Host agents use `docker run -i`. HTTP/SSE can wait
+until someone needs a long-lived daemon.
 
 ---
 
 ## Tools
 
-Each tool is a direct clangd capability. Light presentation only: relative
-paths, UTF-8 positions, default result caps, optional snippets. No
-cross-tool "review report" assembly.
+Each tool is a direct clangd capability. Light presentation only: paths
+as clangd returned them (absolute, matching the index), UTF-8 positions,
+default result caps, optional snippets. No cross-tool review assembly.
 
-When a tool is position-based and clangd can resolve the token, include
-`name`, `containerName`, `kind`, `usr`, `id` from `textDocument/symbolInfo`
-where it is cheap (one extra request).
+When a tool is position-based and the token resolves, include `name`,
+`containerName`, `kind`, `usr`, `id` from `textDocument/symbolInfo` where
+it is cheap.
 
 Default caps (overridable per call): `max_results=50`, `snippet_lines=0`,
 `call_depth=1`.
@@ -160,8 +223,8 @@ Default caps (overridable per call): `max_results=50`, `snippet_lines=0`,
 | `get_hover` | `textDocument/hover` | Truncate long markdown. |
 | `get_definition` | `textDocument/definition` | |
 | `get_declaration` | `textDocument/declaration` | |
-| `get_type_definition` | `textDocument/typeDefinition` | Useful for `auto` / typedefs. |
-| `find_references` | `textDocument/references` | Enable `textDocument.references.container`. Cap the list; optional grouping by file is presentation, not analysis. |
+| `get_type_definition` | `textDocument/typeDefinition` | |
+| `find_references` | `textDocument/references` | Enable `textDocument.references.container`. Cap the list. |
 | `find_implementations` | `textDocument/implementation` | |
 | `get_callers` | `prepareCallHierarchy` + `incomingCalls` | `depth` default 1. |
 | `get_callees` | `prepareCallHierarchy` + `outgoingCalls` | Same. |
@@ -173,54 +236,48 @@ Default caps (overridable per call): `max_results=50`, `snippet_lines=0`,
 | `clangd_status` | initialize + fileStatus | clangd version, index-file path, ready?, open files. |
 
 Omitted: `completion`, `rename`, `codeAction`, `formatting`, `inlayHints`,
-`semanticTokens`, `inactiveRegions` as tools, `$/memoryUsage` (maybe a
-verbose flag on `clangd_status` later).
+`semanticTokens`, `inactiveRegions` as tools, `$/memoryUsage`, and any
+`build_index` MCP tool.
 
 ---
 
 ## Example caller flow
 
-A review agent (implemented elsewhere) has a diff and a list of
-`file:line:col` or symbol names:
+1. Image built once (CI or local).
+2. `docker run … index` on the project's `compile_commands.json`.
+3. Agent config points at `docker run -i … serve` with the same mounts
+   and the index file path.
+4. Agent calls `search_symbols` / `get_definition` / `find_references` /
+   `get_callers` / … as needed.
 
-1. `search_symbols` or `get_file_symbols` to bind a name/position.
-2. `get_definition` / `get_hover` / `get_symbol_info`.
-3. `find_references` / `get_callers` / `find_implementations` /
-   `get_type_hierarchy` as needed.
-4. The agent (or another tool) decides what is relevant to the review.
-
-An index-diff job (also elsewhere) emits added/removed/changed symbols
-with names and locations; it uses the same primitives against this MCP
-pointed at the "after" index file.
+A review or index-diff job (elsewhere) uses the same `serve` tools.
 
 ---
 
 ## Operational details
 
-**Readiness.** Wait for LSP initialize, then for the static index to
-finish loading (`--index-file` is applied asynchronously inside clangd).
-`clangd_status` should say when index-backed tools are safe. For an
-opened file, wait on `textDocument/clangd.fileStatus` before
-position-based AST requests.
+**Readiness.** After LSP initialize, wait until the static index has
+finished loading (`--index-file` is applied asynchronously in clangd).
+`clangd_status` reports when index-backed tools are safe. For an opened
+file, wait on `textDocument/clangd.fileStatus` before AST requests.
 
-**didOpen.** Only files the tool needs. Close after idle. Do not open the
-whole project.
+**didOpen.** Only files the tool needs. Close after idle.
 
-**Compile database.** Fail clearly if a position-based/AST tool is called
-and clangd has no compile command for that file. Index-only tools should
+**Compile database.** Fail clearly if an AST/position tool is called and
+clangd has no compile command for that file. Index-only tools should
 still work.
 
-**Result hygiene.** Cap lists. Do not dump thousands of reference
-locations unless the caller raises `max_results`.
+**Result hygiene.** Cap lists.
 
-**Concurrency.** One clangd stdio socket: serialize LSP requests; MCP
-tool calls queue.
+**Concurrency.** One clangd stdio socket inside the container; MCP tool
+calls queue.
 
-**Paths.** Tool arguments that are files must resolve under the workspace
-root (after realpath). The index file may live outside the workspace
-(artifact store, regression output).
+**Security.** Container entrypoint is `index` or `serve` only. No
+arbitrary host shell. Bind mounts are the caller's responsibility.
 
-**Security.** No arbitrary shell. Subprocess is clangd only.
+**Resource.** `clangd-indexer` over a large CDB is CPU- and memory-heavy.
+`index` should document that; `serve` is lighter once the file exists
+but clangd plus the loaded index can still be large.
 
 ---
 
@@ -228,15 +285,17 @@ root (after realpath). The index file may live outside the workspace
 
 ### Phase 0 — this document
 
-Agree that the server is a clangd interface, not a review product.
+Container + bundled clangd/indexer; MCP remains query-only.
 
-### Phase 1 — skeleton
+### Phase 1 — skeleton + image
 
-- Package, stdio MCP server.
+- TypeScript MCP stdio server.
 - clangd spawn with required `--index-file` and `--background-index=false`.
 - Document session (`didOpen` / `didClose` / fileStatus wait).
 - `clangd_status`, `search_symbols`, `get_hover`, `get_definition`,
   `find_references`.
+- Dockerfile: pinned clangd + indexing-tools + Node runtime.
+- Image entrypoint: `index` | `serve`.
 
 ### Phase 2 — remaining clangd tools
 
@@ -246,38 +305,39 @@ Agree that the server is a clangd interface, not a review product.
 
 ### Phase 3 — polish
 
-- Caps, optional snippets, relative paths, `usr`/`id` on resolved
-  positions.
-- Unit tests against a mocked LSP; one integration test with a tiny C++
-  fixture + a `clangd-indexer` index file (if clangd is available).
-- README: how to point Cursor / Claude Code at the server.
+- Caps, optional snippets, `usr`/`id` on resolved positions.
+- Unit tests against a mocked LSP.
+- One integration test: fixture C++ project → `index` → `serve` → a few
+  tool calls, all in the image.
+- README: Docker run examples and Cursor / Claude Code MCP config.
 
 ---
 
 ## Open questions
 
-1. **TypeScript vs Python** — plan assumes TypeScript.
-2. **Bundle clangd or not?** Ship a clangd (and maybe `clangd-indexer`)
-   next to the MCP vs require a compatible binary on `PATH`. Bundling
-   makes "index file in, answers out" more hermetic; it also means
-   versioning clangd with this repo and dealing with platform binaries.
-   v1 can require `PATH` and leave vendoring as a follow-up.
-3. **Index-only mode vs always needing a workspace checkout.** The static
-   index has symbol locations, but many LSP methods still open the file.
-   Assume a matching source tree for v1.
+1. **TypeScript vs Python** — plan assumes TypeScript (fits a Node-based
+   image). Easy to flip before Phase 1.
+2. **How much toolchain to ship.** A default `clang`/`g++` covers
+   `/usr/bin/c++`. Projects with custom compilers keep mounting those
+   paths. We will learn from real CDBs whether the default is enough.
+3. **stdio vs HTTP.** v1 is `docker run -i` stdio. A long-running
+   HTTP MCP can be added if attaching many agents to one clangd matters.
 4. **Lookup-by-USR** would need a clangd-side extension. Out of scope
    unless name+location collisions become real.
+5. **Path remapping** is explicitly deferred. If same-path bind mounts
+   become unusable (CI runners, mixed OS paths), that is a later design.
 
 ---
 
 ## What success looks like
 
-An agent can point this server at a workspace and a `clangd-indexer`
-file and then, through MCP tools only:
+From one image, without a host clangd install:
 
-- search project symbols
-- resolve definition / declaration / type / hover at a position
-- list references, callers, callees, implementations, bases/derived
-- outline a file and read its diagnostics
+- `index` produces a static index from an existing compile database.
+- `serve` answers search, definition, hover, references, callers,
+  implementations, and type hierarchy against that file.
+- Host paths used in the compile database and the index are the same
+  paths inside the container.
 
-…without this repo knowing what a review, a diff, or a second index is.
+The server still does not know what a review, a diff, or a second index
+is.
