@@ -24,6 +24,7 @@ import type {
 } from "./types.js";
 
 const FILE_IDLE_TIMEOUT_MS = 30_000;
+const FILE_STATUS_GRACE_MS = 1_500;
 const DEFAULT_MAX_RESULTS = 50;
 
 export type ClangdSessionOptions = {
@@ -188,6 +189,7 @@ export class ClangdSession {
       },
     });
     client.notify("initialized", {});
+    await this.waitForIndex();
   }
 
   async stop(): Promise<void> {
@@ -621,12 +623,26 @@ export class ClangdSession {
       return;
     }
     await new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, FILE_IDLE_TIMEOUT_MS);
+      let seenStatus = Boolean(current);
+      const finish = () => {
+        clearTimeout(hardTimer);
+        clearTimeout(graceTimer);
+        client.off("fileStatus", onStatus);
+        resolve();
+      };
+      const hardTimer = setTimeout(finish, FILE_IDLE_TIMEOUT_MS);
+      const graceTimer = setTimeout(() => {
+        if (!seenStatus) {
+          finish();
+        }
+      }, FILE_STATUS_GRACE_MS);
       const onStatus = (status: { uri: string; state: string }) => {
-        if (status.uri === uri && /idle/i.test(status.state)) {
-          clearTimeout(timer);
-          client.off("fileStatus", onStatus);
-          resolve();
+        if (status.uri !== uri) {
+          return;
+        }
+        seenStatus = true;
+        if (/idle/i.test(status.state)) {
+          finish();
         }
       };
       client.on("fileStatus", onStatus);
@@ -649,6 +665,23 @@ export class ClangdSession {
       };
       client.on("diagnostics", onDiag);
     });
+  }
+
+  private async waitForIndex(): Promise<void> {
+    const deadline = Date.now() + 3_000;
+    while (Date.now() < deadline) {
+      try {
+        const result = await this.requireClient().request<unknown[] | null>("workspace/symbol", {
+          query: "",
+        });
+        if (Array.isArray(result) && result.length > 0) {
+          return;
+        }
+      } catch {
+        // clangd may still be loading the static index
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
   }
 
   private requireClient(): LspClient {

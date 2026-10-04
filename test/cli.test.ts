@@ -23,14 +23,24 @@ test("parseCli serve requires exactly one index source", () => {
 });
 
 test("parseCli serve with index file", () => {
-  const options = parseCli(["serve", "--workspace", "/proj", "--index-file", "/proj/a.idx"]);
-  assert.equal(options.command, "serve");
-  if (options.command !== "serve") {
-    throw new Error("expected serve");
+  const previous = process.env.CLANGD;
+  delete process.env.CLANGD;
+  try {
+    const options = parseCli(["serve", "--workspace", "/proj", "--index-file", "/proj/a.idx"]);
+    assert.equal(options.command, "serve");
+    if (options.command !== "serve") {
+      throw new Error("expected serve");
+    }
+    assert.equal(options.workspace, "/proj");
+    assert.equal(options.indexFile, "/proj/a.idx");
+    assert.equal(options.clangdPath, "clangd");
+  } finally {
+    if (previous === undefined) {
+      delete process.env.CLANGD;
+    } else {
+      process.env.CLANGD = previous;
+    }
   }
-  assert.equal(options.workspace, "/proj");
-  assert.equal(options.indexFile, "/proj/a.idx");
-  assert.equal(options.clangdPath, "clangd");
 });
 
 test("parseCli serve with remote index", () => {

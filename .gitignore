@@ -4,3 +4,5 @@ dist/
 .clangd-mcp/
 .DS_Store
 *.idx
+test/fixture/compile_commands.json
+test/fixture/**/*.o
